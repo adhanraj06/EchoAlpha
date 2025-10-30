@@ -1,0 +1,8 @@
+beautifulsoup4
+matplotlib
+nltk
+pandas
+seaborn
+sec_edgar_downloader
+tqdm
+yfinance
