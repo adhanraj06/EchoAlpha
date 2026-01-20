@@ -1,8 +1,14 @@
-beautifulsoup4
-matplotlib
-nltk
-pandas
-seaborn
-sec_edgar_downloader
-tqdm
-yfinance
+# Core Dependencies
+beautifulsoup4>=4.12.2
+matplotlib>=3.7.0
+nltk>=3.8.1
+pandas>=2.0.0
+seaborn>=0.12.2
+sec_edgar_downloader>=3.0.6
+tqdm>=4.65.0
+yfinance>=0.2.18
+
+# Development Dependencies
+black>=23.3.0
+flake8>=6.0.0
+pdoc>=14.0.0

@@ -7,7 +7,11 @@ env/
 ENV/
 .ipynb_checkpoints/
 *.nbconvert.ipynb
-/data/*
+docs/
+data/
+backtest/
+study/
+ticker_analysis/
 *.csv
 *.tsv
 *.log

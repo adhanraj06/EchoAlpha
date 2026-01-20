@@ -1,465 +1,570 @@
-import pandas as pd
 import os
-import glob
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import seaborn as sns
+
+import pandas as pd
+import numpy as np
+
 
 def load_price_data(ticker):
-    """
-    Load and format daily price data for a given ticker from CSV.
+    """Load price data for a given ticker from a CSV file.
 
-    Parameters:
-    -----------
-    ticker : str
-        Stock ticker symbol.
+    Args:
+        ticker (str): Ticker symbol of the stock.
 
     Returns:
-    --------
-    pandas.DataFrame or None
-        DataFrame indexed by date containing price data with columns such as 'Close' and 'Return'.
-        Returns None if the data file is not found.
+        pandas.DataFrame: Price data for the ticker, with 'Date' as the index.
     """
+
     try:
-        price_df = pd.read_csv(f"data/price_data/{ticker}_daily.csv", parse_dates=["Date"])
+        price_df = pd.read_csv(
+            f"data/price_data/{ticker}_daily.csv", parse_dates=["Date"]
+        )
         price_df.set_index("Date", inplace=True)
         price_df.sort_index(inplace=True)
         return price_df
     except FileNotFoundError:
-        print(f"⚠Missing Price Data for {ticker}")
+        print(f"Missing Price Data for {ticker}")
         return None
 
-def generate_signals_for_ticker(
-    bull_threshold, bear_threshold, ticker, ticker_df, price_df, return_col,
-    wait_weeks, hold_weeks, initial_balance=100000, transaction_cost=0.001
-):
-    """
-    Generate trade signals and calculate returns for a single ticker based on sentiment and price reactions.
 
-    Parameters:
-    -----------
-    bull_threshold : float
-        Threshold ratio of positive to negative sentiment to classify as bullish.
-    bear_threshold : float
-        Threshold ratio of positive to negative sentiment to classify as bearish.
-    ticker : str
-        Stock ticker symbol.
-    ticker_df : pandas.DataFrame
-        DataFrame containing sentiment and return data for the ticker.
-    price_df : pandas.DataFrame
-        Daily price DataFrame indexed by date.
-    return_col : str
-        Column name in ticker_df representing the returns to use for signal generation.
-    wait_weeks : int
-        Number of weeks to wait after filing date before entering the trade.
-    hold_weeks : int
-        Number of weeks to hold the trade.
-    initial_balance : float, optional
-        Starting capital for trade simulations (default 100,000).
-    transaction_cost : float, optional
-        Proportional transaction cost per trade side (default 0.001).
+def generate_signals_for_ticker(
+    bull_threshold,
+    bear_threshold,
+    ticker,
+    ticker_df,
+    price_df,
+    return_col,
+    wait_weeks,
+    hold_weeks,
+    initial_balance=100000,
+    transaction_cost=0.001,
+    analysis_mode="real",
+    strategy="longshort",
+    null_seed: int | None = None,
+    max_position_size: float = 0.10,
+):
+    """Generate trading signals for a given ticker based on sentiment and price data.
+
+    Args:
+        bull_threshold: Bull threshold for sentiment classification
+        bear_threshold: Bear threshold for sentiment classification
+        ticker: Corresponding ticker to generate signals for
+        ticker_df: Sentiment data for the ticker
+        price_df: Price data for the ticker
+        return_col: Column name for the return data
+        wait_weeks: Wait weeks for signal
+        hold_weeks: Hold weeks for signal
+        initial_balance: Initial balance for the backtest
+        transaction_cost: Transaction cost as a percentage
+        analysis_mode: "real" or "null"
+        strategy: "long" or "short" or "longshort"
+        null_seed: Random seed for null mode (optional)
+        max_position_size: Maximum position size as a percentage of balance
 
     Returns:
-    --------
-    list of dict
-        List of trade signal dictionaries containing trade metadata and performance metrics.
+        List of trading signals for the given ticker.
     """
-    # define bullish and bearish sentiment measures (customizable)
+
+    # Classifies a filing as bullish based on sentiment
     def is_bullish(row):
         if row["neg"] == 0:
             return row["pos"] > 0
         return (row["pos"] / row["neg"]) > bull_threshold
 
+    # Classifies a filing as bearish based on sentiment
     def is_bearish(row):
         if row["neg"] == 0:
             return False
         return (row["pos"] / row["neg"]) < bear_threshold
 
+    # Generate signals
     signals = []
-    balance = initial_balance  # track running balance through trades
+    balance = initial_balance
+    if null_seed is None:
+        base = 0
+    else:
+        base = int(null_seed)
 
+    seed = (
+        hash(
+            (
+                base,
+                ticker,
+                bull_threshold,
+                bear_threshold,
+                return_col,
+                wait_weeks,
+                hold_weeks,
+                strategy,
+            )
+        )
+        & 0xFFFFFFFF
+    )
+    rng = np.random.default_rng(seed)
     for _, row in ticker_df.iterrows():
-        filing_date = row["filing_date"]
-        reaction = row[return_col]
-
-        # convert to timestamp
-        try:
-            filing_date = pd.to_datetime(filing_date)
-        except:
+        filing_date = pd.to_datetime(row["filing_date"], errors="coerce")
+        if pd.isna(filing_date):
             continue
 
-        # set signal direction
-        sentiment_bull = is_bullish(row)
-        sentiment_bear = is_bearish(row)
-
+        reaction = row[return_col]
         if pd.isna(reaction):
             continue
 
-        # determine signal type based on sentiment and price reaction
-        signal = None
+        # If reaction = negative and filing = bullish, generate a long signal
+        # If reaction = positive and filing = bearish, generate a short signal
+        real_direction = None
+        sentiment_bull = is_bullish(row)
+        sentiment_bear = is_bearish(row)
         if reaction < 0 and sentiment_bull:
-            signal = "long"
+            real_direction = "long"
+            if strategy == "short":
+                continue
         elif reaction > 0 and sentiment_bear:
-            signal = "short"
-        if not signal:
+            real_direction = "short"
+            if strategy == "long":
+                continue
+        else:
             continue
 
-        # define entry and exit dates
+        signal = None
+        if analysis_mode == "real":
+            signal = real_direction
+        elif analysis_mode == "null":
+            signal = rng.choice(["long", "short"])
+
+        # Intended dates (calendar-based)
         entry_date = filing_date + pd.Timedelta(weeks=wait_weeks)
         exit_date = entry_date + pd.Timedelta(weeks=hold_weeks)
 
-        if entry_date not in price_df.index or exit_date not in price_df.index:
-            continue
+        # Executed dates (trading-calendar based)
+        def next_trading_day(idx, dt):
+            pos = idx.searchsorted(dt)
+            return None if pos >= len(idx) else idx[pos]
 
-        entry_price = price_df.loc[entry_date]["Close"]
-        exit_price = price_df.loc[exit_date]["Close"]
+        entry_dt = next_trading_day(price_df.index, entry_date)
+        exit_dt = next_trading_day(price_df.index, exit_date)
+        if entry_dt is None or exit_dt is None:
+            continue
+        entry_price = price_df.loc[entry_dt, "Close"]
+        exit_price = price_df.loc[exit_dt, "Close"]
 
         ret = (exit_price - entry_price) / entry_price * 100
         if signal == "short":
             ret *= -1
 
-        # calculate transaction costs for entry and exit (2x)
-        cost = balance * transaction_cost * 2
-        # calculate PnL net of transaction costs in dollars
-        trade_pnl = (ret / 100) * balance - cost
-        balance += trade_pnl  # update balance after trade
+        # Calculate position size and transaction costs
+        signal_numeric = (row["pos"] - row["neg"]) / max(row["pos"] + row["neg"], 1)
+        position_size = balance * min(abs(signal_numeric), max_position_size)
+        cost = position_size * transaction_cost * 2
+        trade_pnl = (ret / 100) * position_size - cost
+        balance += trade_pnl
 
-        signals.append({
-            "ticker": ticker,
-            "filing_date": filing_date,
-            "entry_date": entry_date,
-            "exit_date": exit_date,
-            "signal": signal,
-            "return_%": round(ret, 2),
-            "reaction": reaction,
-            "sentiment_bull": sentiment_bull,
-            "sentiment_bear": sentiment_bear,
-            "trade_pnl": round(trade_pnl, 2),
-            "balance_after_trade": round(balance, 2),
-        })
+        signals.append(
+            {
+                "ticker": ticker,
+                "filing_date": filing_date,
+                "entry_date": entry_dt,
+                "exit_date": exit_dt,
+                "signal": signal,
+                "signal_numeric": signal_numeric,
+                "return_%": round(ret, 2),
+                "reaction": reaction,
+                "sentiment_bull": sentiment_bull,
+                "sentiment_bear": sentiment_bear,
+                "trade_pnl": round(trade_pnl, 2),
+                "balance_after_trade": round(balance, 2),
+            }
+        )
 
     return signals
 
-def run_backtests(
-    bull_threshold, bear_threshold, wait_weeks, hold_weeks,
-    initial_balance=100000, transaction_cost=0.001
-):
-    """
-    Run backtests across all combinations of return modes, wait weeks, and hold weeks,
-    generating CSV files summarizing trade signals and returns.
 
-    Parameters:
-    -----------
-    bull_threshold : float
-        Threshold ratio for bullish sentiment classification.
-    bear_threshold : float
-        Threshold ratio for bearish sentiment classification.
-    wait_weeks : iterable of int
-        Iterable of waiting periods in weeks before entering trades.
-    hold_weeks : iterable of int
-        Iterable of holding periods in weeks for trades.
-    initial_balance : float, optional
-        Initial capital for all backtests (default 100,000).
-    transaction_cost : float, optional
-        Transaction cost per trade side (default 0.001).
+def run_backtests(
+    bull_thresholds,
+    bear_thresholds,
+    wait_weeks,
+    hold_weeks,
+    lambdas,
+    robustness_ratio=1,
+    initial_balance=100000,
+    transaction_cost=0.001,
+    analysis_mode="real",
+    strategy="longshort",
+    save_path="backtest/grid_results.csv",
+    null_seed: int | None = None,
+):
+    """Run backtests for different configurations.
+
+    Args:
+        bull_thresholds: List of bull threshold values to test
+        bear_thresholds: List of bear threshold values to test
+        wait_weeks: List of wait week values to test
+        hold_weeks: List of hold week values to test
+        lambdas: List of lambda values to test
+        robustness_ratio: Ratio to multiply st dev by for robust EAE calculation
+        initial_balance: Initial balance for the backtest
+        transaction_cost: Transaction cost as a percentage
+        analysis_mode: "real" or "null"
+        strategy: "l" or "s" or "longshort" to specify the strategy
+        save_path: Path to save the results
+        null_seed: Random seed for null mode (optional)
 
     Returns:
-    --------
-    None
-        Saves backtest results as CSV files under 'backtest/' directory.
+        DataFrame containing the results of the backtest
     """
-    # load mdna sentiment and return data
-    sentiment_df = pd.read_csv("data/mdna_sentiment_scores.csv", parse_dates=["filing_date"])
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    sentiment_df = pd.read_csv(
+        "data/mdna_sentiment_scores.csv", parse_dates=["filing_date"]
+    )
+
     return_modes = {
         1: "return_mode1_signed",
         2: "return_mode2_volume_spike",
-        3: "return_mode3_top3_vol_avg"
+        3: "return_mode3_top3_vol_avg",
     }
 
-    # loop through all combinations (meant to backtest and find optimal parameters)
-    for i in range(1, 4):  # 3 return modes
-        for j in wait_weeks:  # wait length in weeks
-            for k in hold_weeks:  # holding length in weeks
-                signals = []
+    # Load price and sentiment data once (big speedup, no result change)
+    tickers = sorted(sentiment_df["ticker"].unique())
+    price_cache = {t: load_price_data(t) for t in tickers}
+    sent_by_ticker = {t: df.copy() for t, df in sentiment_df.groupby("ticker")}
+    max_position_size = (100 // len(tickers)) / 100
 
-                # for each ticker and filing, generate trade signals and calculate returns
-                for ticker in sentiment_df["ticker"].unique():
-                    price_df = load_price_data(ticker)
-                    if price_df is None:
-                        continue
+    results = []
 
-                    # iterate over each filing row for this ticker to generate signals
-                    ticker_df = sentiment_df[sentiment_df["ticker"] == ticker].copy()
-                    ticker_signals = generate_signals_for_ticker(
-                        bull_threshold=bull_threshold,
-                        bear_threshold=bear_threshold,
-                        ticker=ticker,
-                        ticker_df=ticker_df,
-                        price_df=price_df,
-                        return_col=return_modes[i],
-                        wait_weeks=j,
-                        hold_weeks=k,
-                        initial_balance=initial_balance,
-                        transaction_cost=transaction_cost
-                    )
+    for bull in bull_thresholds:
+        for bear in bear_thresholds:
+            for mode_id, return_col in return_modes.items():
+                for w in wait_weeks:
+                    for h in hold_weeks:
+                        # collect trades across tickers for THIS config
+                        signals = []
+                        for ticker in tickers:
+                            price_df = price_cache.get(ticker)
+                            if price_df is None:
+                                continue
+                            ticker_df = sent_by_ticker.get(ticker)
+                            if ticker_df is None:
+                                continue
 
-                    # tag with backtest config
-                    for s in ticker_signals:
-                        s.update({
-                            "mode": i,
-                            "wait_weeks": j,
-                            "hold_weeks": k
-                        })
+                            ticker_signals = generate_signals_for_ticker(
+                                bull,
+                                bear,
+                                ticker,
+                                ticker_df,
+                                price_df,
+                                return_col,
+                                w,
+                                h,
+                                initial_balance,
+                                transaction_cost,
+                                analysis_mode,
+                                strategy,
+                                null_seed=null_seed,
+                                max_position_size=max_position_size,
+                            )
+                            signals.extend(ticker_signals)
 
-                    signals.extend(ticker_signals)
+                        trades_df = pd.DataFrame(signals)
 
-                signals_df = pd.DataFrame(signals)
-                signals_df.to_csv(f"backtest/mode{i}_wait{j}_hold{k}.csv", index=False)
+                        metrics = summarize_trades_df(trades_df, initial_balance)
 
-def analyze_backtests(tickers, start_date, initial_balance):
-    """
-    Load, analyze, and visualize all backtest CSV files; print top and bottom performance metrics.
+                        row = {
+                            "bull_threshold": bull,
+                            "bear_threshold": bear,
+                            "return_mode": mode_id,
+                            "wait_weeks": w,
+                            "hold_weeks": h,
+                            "analysis_mode": analysis_mode,
+                            "strategy": strategy,
+                            "null_seed": null_seed,
+                            **metrics,
+                        }
+                        results.append(row)
 
-    Parameters:
-    -----------
-    tickers : list of str
-        List of tickers analyzed (used for plotting and reporting).
-    start_date : str
-        Start date for analysis (not directly used here, but kept for consistency).
-    initial_balance : float
-        Initial capital used in backtests.
+    results_df = pd.DataFrame(results)
 
-    Returns:
-    --------
-    None
-        Displays plots and prints summary statistics.
-    """
-    master_df = load_backtest_data()
-    summary = summarize_backtest_results(master_df)
+    # Estimate n0 from the grid itself and compute EAE for each lambda (long format)
+    n0_hat = int(estimate_n0_from_bins(results_df, metric="cum_return_pct"))
+    min_trades = max(20, n0_hat // 2)
+    results_df["n0_hat"] = n0_hat
 
-    # plot performance heatmaps across wait/hold for each mode and metric
-    metrics = ["mean_norm_return", "sharpe_ratio", "win_rate"]
-    plot_heatmaps(summary, metrics)
+    eae_means: list[float] = []
+    eae_stds: list[float] = []
 
-    # plot pnl, drawdown, etc. for best config per mode
-    for mode in sorted(summary["mode"].unique()):
-        best_config = (
-            summary[summary["mode"] == mode]
-            .sort_values("sharpe_ratio", ascending=False)
-            .iloc[0]["config"]
-        )
-        config_trades = master_df[master_df["config"] == best_config].copy()
-        plot_config_timeseries(config_trades, best_config, initial_balance)
+    for row in results_df.itertuples(index=False):
+        trades = getattr(row, "trades", None)
+        trades = int(trades) if pd.notna(trades) else None
 
-    summary = pd.read_csv("backtest/summary_results.csv")
+        eae_vals = []
+        for lam in lambdas:
+            eae = compute_eae(
+                cum_return_pct=getattr(row, "cum_return_pct"),
+                max_drawdown_pct=getattr(row, "max_drawdown"),
+                trades=trades,
+                lam=float(lam),
+                n0=n0_hat,
+                min_trades=min_trades,
+            )
+            eae_vals.append(float(eae))
 
-    print_top_bottom_metrics(summary, metric="sharpe_ratio", top_n=10)
-    print_top_bottom_metrics(summary, metric="mean_norm_return", top_n=10)
+        eae_means.append(float(np.mean(eae_vals)))
+        eae_stds.append(float(np.std(eae_vals, ddof=1)))
 
-def load_backtest_data():
-    """
-    Load and concatenate all backtest CSV files into a single DataFrame with added metadata.
+    results_df["eae_mean"] = eae_means
+    results_df["eae_std"] = eae_stds
 
-    Returns:
-    --------
-    pandas.DataFrame
-        Combined DataFrame of all backtest trades with additional columns like normalized returns and signal types.
-    """
-    all_paths = glob.glob("backtest/mode*_wait*_hold*.csv")
-    all_results = []
-
-    for path in all_paths:
-        df = pd.read_csv(path)
-        df["config"] = os.path.basename(path).replace(".csv", "")  # e.g., 'mode1_wait0_hold1'
-        df["normalized_return"] = df["return_%"] / df["hold_weeks"]
-        all_results.append(df)
-
-    master_df = pd.concat(all_results, ignore_index=True)
-    master_df["is_long"] = master_df["signal"] == "long"
-    master_df["is_short"] = master_df["signal"] == "short"
-    return master_df
-
-def summarize_backtest_results(master_df):
-    """
-    Summarize backtest results by configuration, calculating performance metrics and saving a summary CSV.
-
-    Parameters:
-    -----------
-    master_df : pandas.DataFrame
-        Combined DataFrame of all backtest trades.
-
-    Returns:
-    --------
-    pandas.DataFrame
-        Summary DataFrame with metrics such as trade count, median return, win rate, Sharpe ratio, etc.
-    """
-    summary = (
-        master_df
-        .groupby("config", group_keys=False)
-        .apply(lambda group: pd.Series({
-            "trades": group["return_%"].count(),
-            "median_return": group["return_%"].median(),
-            "std_return": group["return_%"].std(),
-            "win_rate": (group["return_%"] > 0).mean(),
-            "mean_norm_return": group["normalized_return"].mean(),
-            "sharpe_ratio": group["normalized_return"].mean() / group["normalized_return"].std()
-            if group["normalized_return"].std() > 0 else 0,
-            "avg_long_return": group.loc[group["is_long"], "return_%"].mean(),
-            "avg_short_return": group.loc[group["is_short"], "return_%"].mean()
-        }))
-        .reset_index()
+    results_df["eae"] = (
+        results_df["eae_mean"] - float(robustness_ratio) * results_df["eae_std"]
     )
 
-    summary[["mode", "wait", "hold"]] = summary["config"].str.extract(r"mode(\d+)_wait(\d+)_hold(\d+)")
-    summary[["mode", "wait", "hold"]] = summary[["mode", "wait", "hold"]].astype(int)
-    summary.to_csv("backtest/summary_results.csv", index=False)
-    return summary
+    if save_path is not None:
+        results_df.to_csv(save_path, index=False)
 
-def plot_heatmaps(summary, metrics):
-    """
-    Plot heatmaps of backtest performance metrics across wait and hold week combinations for each mode.
+    return results_df
 
-    Parameters:
-    -----------
-    summary : pandas.DataFrame
-        Summary DataFrame containing backtest metrics grouped by config.
-    metrics : list of str
-        List of metric column names to plot heatmaps for (e.g., ["sharpe_ratio", "win_rate"]).
+
+def summarize_trades_df(trades_df: pd.DataFrame, initial_balance: float) -> dict:
+    """Summarize trade results for a single configuration.
+
+    Args:
+        trades_df: DataFrame with trade results
+        initial_balance: Initial balance for the backtest
 
     Returns:
-    --------
-    None
-        Displays heatmap plots.
+        Dictionary with summary metrics
     """
-    for metric in metrics:
-        for mode in sorted(summary["mode"].unique()):
-            subset = summary[summary["mode"] == mode]
-            pivot_table = subset.pivot(index="wait", columns="hold", values=metric)
 
-            plt.figure(figsize=(10, 7))
-            sns.heatmap(pivot_table, annot=True, fmt=".3f", cmap="RdYlGn", center=0)
-            plt.title(f"{metric.replace('_', ' ').title()} Heatmap — Mode {mode}")
-            plt.xlabel("Hold Weeks")
-            plt.ylabel("Wait Weeks")
-            plt.tight_layout()
-            plt.show()
+    if trades_df is None or trades_df.empty:
+        return {
+            "trades": 0,
+            "bull_trades": 0,
+            "bear_trades": 0,
+            "long_signal_count": 0,
+            "short_signal_count": 0,
+            "avg_long_return": np.nan,
+            "avg_short_return": np.nan,
+            "long_signal_numeric_mean": np.nan,
+            "long_signal_numeric_std": 0.0,
+            "short_signal_numeric_mean": np.nan,
+            "short_signal_numeric_std": 0.0,
+            "total_signal_numeric_mean": np.nan,
+            "total_signal_numeric_std": 0.0,
+            "long_signal_numeric_count": 0,
+            "short_signal_numeric_count": 0,
+            "long_signal_ic": np.nan,
+            "short_signal_ic": np.nan,
+            "trades_ic": np.nan,
+            "bull_win_rate": np.nan,
+            "bear_win_rate": np.nan,
+            "bull_return": np.nan,
+            "bear_return": np.nan,
+            "long_signal_win_rate": np.nan,
+            "short_signal_win_rate": np.nan,
+            "cum_return_pct": 0.0,
+            "long_return_pct": 0.0,
+            "short_return_pct": 0.0,
+            "median_return": np.nan,
+            "std_return": 0.0,
+            "win_rate": np.nan,
+            "max_drawdown": np.nan,
+        }
 
-def plot_config_timeseries(config_trades, best_config, initial_balance, benchmark_df=None):
+    g = trades_df.copy()
+
+    g["is_long"] = g["signal"] == "long"
+    g["is_short"] = g["signal"] == "short"
+
+    # Safe helpers
+    def safe_mean(x: pd.Series) -> float:
+        x = x.dropna()
+        return float(x.mean()) if len(x) else np.nan
+
+    def safe_std(x: pd.Series) -> float:
+        x = x.dropna()
+        return float(x.std(ddof=1)) if len(x) >= 2 else 0.0
+
+    def safe_corr(x: pd.Series, y: pd.Series, min_n: int = 2) -> float:
+        xy = pd.concat([x, y], axis=1).dropna()
+        if len(xy) < min_n:
+            return np.nan
+        a, b = xy.iloc[:, 0], xy.iloc[:, 1]
+        if a.std(ddof=1) == 0 or b.std(ddof=1) == 0:
+            return np.nan
+        return float(a.corr(b))
+
+    # Core metrics
+    trades = int(g["return_%"].count())
+    bull_trades = int(g["sentiment_bull"].sum()) if "sentiment_bull" in g.columns else 0
+    bear_trades = int(g["sentiment_bear"].sum()) if "sentiment_bear" in g.columns else 0
+    long_count = int(g["is_long"].sum())
+    short_count = int(g["is_short"].sum())
+    avg_long_return = safe_mean(g.loc[g["is_long"], "return_%"])
+    avg_short_return = safe_mean(g.loc[g["is_short"], "return_%"])
+    long_sig = g.loc[g["is_long"], "signal_numeric"]
+    short_sig = g.loc[g["is_short"], "signal_numeric"]
+    all_sig = g["signal_numeric"]
+    long_ic = safe_corr(g.loc[g["is_long"], "return_%"], long_sig)
+    short_ic = safe_corr(g.loc[g["is_short"], "return_%"], short_sig)
+    trades_ic = safe_corr(g["return_%"], all_sig)
+    bull_mask = (
+        g.get("sentiment_bull", False).astype(bool)
+        if "sentiment_bull" in g.columns
+        else pd.Series(False, index=g.index)
+    )
+    bear_mask = (
+        g.get("sentiment_bear", False).astype(bool)
+        if "sentiment_bear" in g.columns
+        else pd.Series(False, index=g.index)
+    )
+    bull_win_rate = safe_mean(g.loc[bull_mask, "return_%"] > 0)
+    bear_win_rate = safe_mean(g.loc[bear_mask, "return_%"] > 0)
+    bull_return = safe_mean(g.loc[bull_mask, "return_%"])
+    bear_return = safe_mean(g.loc[bear_mask, "return_%"])
+    long_win_rate = safe_mean(g.loc[g["is_long"], "return_%"] > 0)
+    short_win_rate = safe_mean(g.loc[g["is_short"], "return_%"] > 0)
+    cum_return_pct = float(g["trade_pnl"].sum() / initial_balance * 100)
+    long_return_pct = float(
+        g.loc[g["is_long"], "trade_pnl"].sum() / initial_balance * 100
+    )
+    short_return_pct = float(
+        g.loc[g["is_short"], "trade_pnl"].sum() / initial_balance * 100
+    )
+    median_return = float(g["return_%"].median())
+    std_return = safe_std(g["return_%"])
+    win_rate = safe_mean(g["return_%"] > 0)
+    wins = g.loc[g["trade_pnl"] > 0, "trade_pnl"].sum()
+    losses = g.loc[g["trade_pnl"] < 0, "trade_pnl"].sum()
+    profit_factor = np.nan if losses == 0 else float(wins / abs(losses))
+    g = g.sort_values("exit_date")
+    equity = initial_balance + g["trade_pnl"].cumsum()
+    peak = equity.cummax()
+    dd = equity.div(peak).replace([np.inf, -np.inf], np.nan) - 1.0
+    max_dd = float(dd.min() * 100)
+
+    return {
+        "trades": trades,
+        "bull_trades": bull_trades,
+        "bear_trades": bear_trades,
+        "long_signal_count": long_count,
+        "short_signal_count": short_count,
+        "avg_long_return": avg_long_return,
+        "avg_short_return": avg_short_return,
+        "long_signal_numeric_mean": safe_mean(long_sig),
+        "long_signal_numeric_std": safe_std(long_sig),
+        "short_signal_numeric_mean": safe_mean(short_sig),
+        "short_signal_numeric_std": safe_std(short_sig),
+        "total_signal_numeric_mean": safe_mean(all_sig),
+        "total_signal_numeric_std": safe_std(all_sig),
+        "long_signal_numeric_count": int(long_sig.count()),
+        "short_signal_numeric_count": int(short_sig.count()),
+        "long_signal_ic": long_ic,
+        "short_signal_ic": short_ic,
+        "trades_ic": trades_ic,
+        "bull_win_rate": bull_win_rate,
+        "bear_win_rate": bear_win_rate,
+        "bull_return": bull_return,
+        "bear_return": bear_return,
+        "long_signal_win_rate": long_win_rate,
+        "short_signal_win_rate": short_win_rate,
+        "cum_return_pct": cum_return_pct,
+        "long_return_pct": long_return_pct,
+        "short_return_pct": short_return_pct,
+        "median_return": median_return,
+        "std_return": std_return,
+        "win_rate": win_rate,
+        "max_drawdown": max_dd,
+        "profit_factor": profit_factor,
+    }
+
+
+def estimate_n0_from_bins(
+    df: pd.DataFrame,
+    *,
+    metric: str = "cum_return_pct",
+    bins=(0, 5, 10, 15, 20, 30, 50, 100, 200, 500),
+    tol: float = 0.10,
+    tail_bins: int = 2,
+) -> int:
     """
-    Plot cumulative PnL, drawdowns, return histograms, and rolling Sharpe ratio for a selected backtest configuration.
+    Estimate n0 (reliability saturation) from historical backtest bins.
 
-    Parameters:
-    -----------
-    config_trades : pandas.DataFrame
-        DataFrame of trades for the selected configuration.
-    best_config : str
-        Configuration identifier string.
-    initial_balance : float
-        Starting capital for cumulative return calculations.
-    benchmark_df : pandas.DataFrame, optional
-        DataFrame with benchmark price data (e.g., SPY), indexed by date, to compare against.
+    Args:
+        df: DataFrame with backtest results (must have "trades" and metric columns)
+        metric: column name to compute std over (e.g., "cum_return_pct")
+        bins: trade count bins for grouping
+        tol: tolerance for "close enough to plateau" (as fraction)
+        tail_bins: number of top bins to average for plateau definition
 
     Returns:
-    --------
-    None
-        Displays multiple performance plots.
+        Estimated n0 (reliability saturation trades)
     """
-    config_trades.sort_values("exit_date", inplace=True)
-    cum_pnl = config_trades["trade_pnl"].cumsum()
-    exit_dates = pd.to_datetime(config_trades["exit_date"])
 
-    def format_time_axis(ax):
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.xticks(rotation=45)
+    x = df.copy()
+    x = x[np.isfinite(x["trades"]) & np.isfinite(x[metric])]
+    if x.empty:
+        return 20
 
-    # cumulative return percentage for strategy
-    cum_return_pct = cum_pnl / initial_balance * 100
-    plt.figure(figsize=(12, 6))
-    plt.plot(exit_dates, cum_return_pct, label="Strategy", marker="o")
+    x["trade_bin"] = pd.cut(x["trades"], bins=bins, include_lowest=True)
+    s = x.groupby("trade_bin", observed=True)[metric].std().dropna()
+    if len(s) == 0:
+        return 20
 
-    # plot benchmark comparisons
-    if benchmark_df is not None:
-        # align benchmark dates to strategy's date range
-        benchmark_subset = benchmark_df[(benchmark_df.index >= exit_dates.min()) & (benchmark_df.index <= pd.Timestamp.today())]
+    plateau = float(s.tail(tail_bins).mean())
+    if not np.isfinite(plateau) or plateau <= 0:
+        return 20
 
-        # normalize both SPY and EqualWeighted to 100%
-        spy_normalized = (benchmark_subset['SPY'] / benchmark_subset['SPY'].iloc[0]) * 100
-        eqw_normalized = (benchmark_subset['EqualWeighted'] / benchmark_subset['EqualWeighted'].iloc[0]) * 100
+    thresh = plateau * (1.0 + tol)
 
-        plt.plot(benchmark_subset.index, spy_normalized, label="SPY", linestyle="--")
-        plt.plot(benchmark_subset.index, eqw_normalized, label="Equal-Weighted", linestyle="--")
+    # pick earliest bin whose dispersion is ~plateau
+    for interval, val in s.items():
+        if np.isfinite(val) and val <= thresh:
+            return int(interval.right)
 
-    plt.title(f"Cumulative Return (%) Over Time — {best_config}")
-    plt.xlabel("Exit Date")
-    plt.ylabel("Cumulative Return (%)")
-    plt.legend()
-    plt.grid(True)
-    format_time_axis(plt.gca())
-    plt.tight_layout()
-    plt.show()
+    # else fallback to largest trade bin edge
+    return int(s.index[-1].right)
 
-    # plot drawdown
-    running_max = cum_pnl.cummax()
-    drawdown = cum_pnl - running_max
-    plt.figure(figsize=(12, 6))
-    plt.fill_between(exit_dates, drawdown, 0, color='red', alpha=0.3)
-    plt.title(f"Drawdown Over Time — {best_config}")
-    plt.xlabel("Exit Date")
-    plt.ylabel("Drawdown ($)")
-    plt.grid(True)
-    format_time_axis(plt.gca())
-    plt.tight_layout()
-    plt.show()
 
-    # histogram of returns
-    plt.figure(figsize=(10, 6))
-    sns.histplot(config_trades["return_%"], bins=30, kde=True)
-    plt.title(f"Histogram of Trade Returns (%) — {best_config}")
-    plt.xlabel("Return (%)")
-    plt.ylabel("Frequency")
-    plt.tight_layout()
-    plt.show()
+def compute_eae(
+    cum_return_pct: float,
+    max_drawdown_pct: float,
+    trades: int,
+    *,
+    lam: float = 0.5,
+    n0: int = 20,
+    min_trades: int = 10,
+) -> float:
+    """Compute Evidence-Adjusted Edge (EAE) score for a backtest configuration.
 
-    # rolling sharpe ratio
-    returns = config_trades["return_%"] / 100
-    rolling_sharpe = returns.rolling(window=20).mean() / returns.rolling(window=20).std()
-    plt.figure(figsize=(12, 6))
-    plt.plot(exit_dates, rolling_sharpe)
-    plt.title(f"Rolling Sharpe Ratio (window=20 trades) — {best_config}")
-    plt.xlabel("Exit Date")
-    plt.ylabel("Sharpe Ratio")
-    plt.grid(True)
-    format_time_axis(plt.gca())
-    plt.tight_layout()
-    plt.show()
-
-def print_top_bottom_metrics(summary_df, metric, top_n=10):
-    """
-    Print the top and bottom configurations ranked by a specified performance metric.
-
-    Parameters:
-    -----------
-    summary_df : pandas.DataFrame
-        DataFrame containing summarized backtest configurations.
-    metric : str
-        Column name of the metric to rank by (e.g., "sharpe_ratio").
-    top_n : int, optional
-        Number of top and bottom entries to display (default 10).
+    Args:
+        cum_return_pct: Cumulative return percentage
+        max_drawdown_pct: Maximum drawdown percentage
+        trades: Number of trades
+        lam: Drawdown penalty weight
+        n0: Reliability saturation trades
+        min_trades: Hard floor to avoid tiny-sample configs
 
     Returns:
-    --------
-    None
-        Prints ranked configurations to the console.
+        Score = (Return - lam * |MaxDD|) * (1 - exp(-n/n0))
     """
-    print(f"\n=== Top {top_n} Configs by {metric} ===")
-    top_configs = summary_df.sort_values(metric, ascending=False).head(top_n)
-    for _, row in top_configs.iterrows():
-        print(
-            f"{row['config']:15} | {metric}: {row[metric]:.4f} | Trades: {row['trades']} | Win Rate: {row['win_rate'] * 100:.2f}%")
 
-    print(f"\n=== Bottom {top_n} Configs by {metric} ===")
-    bottom_configs = summary_df.sort_values(metric, ascending=True).head(top_n)
-    for _, row in bottom_configs.iterrows():
-        print(
-            f"{row['config']:15} | {metric}: {row[metric]:.4f} | Trades: {row['trades']} | Win Rate: {row['win_rate'] * 100:.2f}%")
+    # basic validity
+    if trades is None or trades < min_trades:
+        return float("-inf")
+
+    if cum_return_pct is None or not np.isfinite(cum_return_pct):
+        return float("-inf")
+
+    if max_drawdown_pct is None or not np.isfinite(max_drawdown_pct):
+        return float("-inf")
+
+    # guard n0
+    n0 = int(n0)
+    if n0 <= 0:
+        n0 = 1
+
+    dd_abs = abs(float(max_drawdown_pct))
+    reliability = 1.0 - float(np.exp(-float(trades) / float(n0)))
+
+    return (float(cum_return_pct) - float(lam) * dd_abs) * reliability
