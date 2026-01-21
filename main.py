@@ -69,14 +69,17 @@ def main():
         extract_sentiment_and_reaction_returns()
         print(f"[Timing] Sentiment extraction: {time.time() - t0:.1f}s")
 
-    bull_thresholds = range(2, 6)
-    bear_thresholds = range(0, 4)
+    bull_thresholds = [0.10, 0.15, 0.20, 0.25, 0.3, 0.35, 0.4]
+    bear_thresholds = [0.10, 0.15, 0.20, 0.25, 0.3, 0.35, 0.4]
     wait_weeks = range(0, 11)
     hold_weeks = range(1, 11)
     lambdas = [0.2, 0.4, 0.6, 0.8, 1.0]
     robustness_ratio = 1.0
     initial_balance = 100000
     transaction_cost = 0.001
+    max_gross = 1.0
+    max_net = 0.3
+    per_position_cap = 0.05
 
     if not os.path.exists(os.path.join(results_dir, "real_longshort_grid_results.csv")):
         print("[6/12] Running L/S backtests with sentiment-based signals")
@@ -98,6 +101,9 @@ def main():
             analysis_mode,
             strategy,
             save_path,
+            max_gross=max_gross,
+            max_net=max_net,
+            per_position_cap=per_position_cap,
         )
         print(f"[Timing] L/S backtest: {time.time() - t0:.1f}s")
 
@@ -134,6 +140,9 @@ def main():
             analysis_mode,
             strategy,
             save_path,
+            max_gross=max_gross,
+            max_net=max_net,
+            per_position_cap=per_position_cap,
         )
         print(f"[Timing] Long-only backtest: {time.time() - t0:.1f}s")
 
@@ -166,6 +175,9 @@ def main():
                 robustness_ratio,
                 initial_balance,
                 transaction_cost,
+                max_gross,
+                max_net,
+                per_position_cap,
             )
             for i in range(num_null_runs)
         ]
@@ -211,7 +223,8 @@ def run_null_backtest(args):
 
     Args:
         args: Tuple containing (run_idx, bull_thresholds, bear_thresholds,
-        wait_weeks, hold_weeks, lambdas, robustness_ratio, initial_balance, transaction_cost)
+        wait_weeks, hold_weeks, lambdas, robustness_ratio, initial_balance, transaction_cost, 
+        max_gross, max_net, per_position_cap)
 
     Returns:
         pandas.DataFrame: Backtest results for this run
@@ -227,6 +240,9 @@ def run_null_backtest(args):
         robustness_ratio,
         initial_balance,
         transaction_cost,
+        max_gross,
+        max_net,
+        per_position_cap,
     ) = args
 
     df = run_backtests(
@@ -242,6 +258,9 @@ def run_null_backtest(args):
         strategy="longshort",
         save_path=None,
         null_seed=run_idx,
+        max_gross=max_gross,
+        max_net=max_net,
+        per_position_cap=per_position_cap,
     )
     return df
 

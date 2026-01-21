@@ -35,55 +35,27 @@ def generate_signals_for_ticker(
     return_col,
     wait_weeks,
     hold_weeks,
-    initial_balance=100000,
-    transaction_cost=0.001,
     analysis_mode="real",
     strategy="longshort",
     null_seed: int | None = None,
-    max_position_size: float = 0.10,
 ):
-    """Generate trading signals for a given ticker based on sentiment and price data.
+    """Generate trade intents for a ticker (no sizing, no PnL)."""
 
-    Args:
-        bull_threshold: Bull threshold for sentiment classification
-        bear_threshold: Bear threshold for sentiment classification
-        ticker: Corresponding ticker to generate signals for
-        ticker_df: Sentiment data for the ticker
-        price_df: Price data for the ticker
-        return_col: Column name for the return data
-        wait_weeks: Wait weeks for signal
-        hold_weeks: Hold weeks for signal
-        initial_balance: Initial balance for the backtest
-        transaction_cost: Transaction cost as a percentage
-        analysis_mode: "real" or "null"
-        strategy: "long" or "short" or "longshort"
-        null_seed: Random seed for null mode (optional)
-        max_position_size: Maximum position size as a percentage of balance
-
-    Returns:
-        List of trading signals for the given ticker.
-    """
-
-    # Classifies a filing as bullish based on sentiment
     def is_bullish(row):
-        if row["neg"] == 0:
-            return row["pos"] > 0
-        return (row["pos"] / row["neg"]) > bull_threshold
-
-    # Classifies a filing as bearish based on sentiment
-    def is_bearish(row):
-        if row["neg"] == 0:
+        s = row.get("finbert_score", np.nan)
+        if pd.isna(s):
             return False
-        return (row["pos"] / row["neg"]) < bear_threshold
+        return float(s) >= float(bull_threshold)
 
-    # Generate signals
-    signals = []
-    balance = initial_balance
-    if null_seed is None:
-        base = 0
-    else:
-        base = int(null_seed)
+    def is_bearish(row):
+        s = row.get("finbert_score", np.nan)
+        if pd.isna(s):
+            return False
+        return float(s) <= -float(bear_threshold)
 
+    trades = []
+
+    base = 0 if null_seed is None else int(null_seed)
     seed = (
         hash(
             (
@@ -100,20 +72,24 @@ def generate_signals_for_ticker(
         & 0xFFFFFFFF
     )
     rng = np.random.default_rng(seed)
+
+    def next_trading_day(idx, dt):
+        pos = idx.searchsorted(dt)
+        return None if pos >= len(idx) else idx[pos]
+
     for _, row in ticker_df.iterrows():
-        filing_date = pd.to_datetime(row["filing_date"], errors="coerce")
+        filing_date = pd.to_datetime(row.get("filing_date", None), errors="coerce")
         if pd.isna(filing_date):
             continue
 
-        reaction = row[return_col]
+        reaction = row.get(return_col, np.nan)
         if pd.isna(reaction):
             continue
 
-        # If reaction = negative and filing = bullish, generate a long signal
-        # If reaction = positive and filing = bearish, generate a short signal
-        real_direction = None
         sentiment_bull = is_bullish(row)
         sentiment_bear = is_bearish(row)
+
+        real_direction = None
         if reaction < 0 and sentiment_bull:
             real_direction = "long"
             if strategy == "short":
@@ -125,57 +101,208 @@ def generate_signals_for_ticker(
         else:
             continue
 
-        signal = None
         if analysis_mode == "real":
             signal = real_direction
         elif analysis_mode == "null":
             signal = rng.choice(["long", "short"])
+        else:
+            continue
 
-        # Intended dates (calendar-based)
         entry_date = filing_date + pd.Timedelta(weeks=wait_weeks)
         exit_date = entry_date + pd.Timedelta(weeks=hold_weeks)
-
-        # Executed dates (trading-calendar based)
-        def next_trading_day(idx, dt):
-            pos = idx.searchsorted(dt)
-            return None if pos >= len(idx) else idx[pos]
 
         entry_dt = next_trading_day(price_df.index, entry_date)
         exit_dt = next_trading_day(price_df.index, exit_date)
         if entry_dt is None or exit_dt is None:
             continue
-        entry_price = price_df.loc[entry_dt, "Close"]
-        exit_price = price_df.loc[exit_dt, "Close"]
 
-        ret = (exit_price - entry_price) / entry_price * 100
-        if signal == "short":
-            ret *= -1
+        entry_price = float(price_df.loc[entry_dt, "Close"])
+        exit_price = float(price_df.loc[exit_dt, "Close"])
+        if not np.isfinite(entry_price) or not np.isfinite(exit_price) or entry_price <= 0:
+            continue
 
-        # Calculate position size and transaction costs
-        signal_numeric = (row["pos"] - row["neg"]) / max(row["pos"] + row["neg"], 1)
-        position_size = balance * min(abs(signal_numeric), max_position_size)
-        cost = position_size * transaction_cost * 2
-        trade_pnl = (ret / 100) * position_size - cost
-        balance += trade_pnl
+        raw_ret = (exit_price - entry_price) / entry_price * 100.0
 
-        signals.append(
+        trades.append(
             {
                 "ticker": ticker,
                 "filing_date": filing_date,
                 "entry_date": entry_dt,
                 "exit_date": exit_dt,
                 "signal": signal,
-                "signal_numeric": signal_numeric,
-                "return_%": round(ret, 2),
-                "reaction": reaction,
-                "sentiment_bull": sentiment_bull,
-                "sentiment_bear": sentiment_bear,
-                "trade_pnl": round(trade_pnl, 2),
-                "balance_after_trade": round(balance, 2),
+                "signal_numeric": float(row.get("finbert_score", 0.0)),
+                "raw_return_%": float(raw_ret),
+                "reaction": float(reaction),
+                "sentiment_bull": bool(sentiment_bull),
+                "sentiment_bear": bool(sentiment_bear),
+                "entry_price": entry_price,
+                "exit_price": exit_price,
             }
         )
 
-    return signals
+    return trades
+
+
+def simulate_portfolio_events(
+    trades_df: pd.DataFrame,
+    *,
+    initial_balance: float = 100000.0,
+    transaction_cost: float = 0.001,
+    max_gross: float = 1.0,
+    max_net: float = 0.3,
+    per_position_cap: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Portfolio simulation with entry/exit events (no daily MTM).
+
+    Expects trades_df to have:
+        entry_date, exit_date, signal ("long"/"short"), raw_return_%
+    """
+
+    if trades_df is None or trades_df.empty:
+        return trades_df
+
+    required = {"entry_date", "exit_date", "signal", "raw_return_%"}
+    missing = required - set(trades_df.columns)
+    if missing:
+        raise ValueError(f"trades_df missing required columns: {sorted(missing)}")
+
+    g = trades_df.copy()
+
+    g["entry_date"] = pd.to_datetime(g["entry_date"], errors="coerce")
+    g["exit_date"] = pd.to_datetime(g["exit_date"], errors="coerce")
+    g["signal"] = g["signal"].astype(str).str.lower()
+
+    # Drop broken rows
+    g = g.dropna(subset=["entry_date", "exit_date", "raw_return_%"])
+    g = g[g["signal"].isin(["long", "short"])]
+    g = g[g["exit_date"] >= g["entry_date"]]
+
+    if g.empty:
+        return g
+
+    g = g.sort_values(["entry_date", "exit_date", "ticker"]).reset_index(drop=True)
+
+    # Output columns (created if missing)
+    out_cols = [
+        "position_weight",
+        "position_size",
+        "entry_cost",
+        "exit_cost",
+        "return_%",
+        "trade_pnl",
+        "balance_after_entry",
+        "balance_after_trade",
+    ]
+    for c in out_cols:
+        if c not in g.columns:
+            g[c] = np.nan
+
+    # Build events (exit before entry on same day)
+    # event_type: 0 = exit, 1 = entry
+    events: list[tuple[pd.Timestamp, int, int]] = []
+    for i in range(len(g)):
+        events.append((g.at[i, "exit_date"], 0, i))
+        events.append((g.at[i, "entry_date"], 1, i))
+    events.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    balance = float(initial_balance)
+
+    # Store open positions by trade idx
+    # We keep entry notional FIXED and use it at exit.
+    open_pos: dict[int, dict] = {}
+
+    def exposures() -> tuple[float, float]:
+        gross = 0.0
+        net = 0.0
+        for p in open_pos.values():
+            w = float(p["w"])
+            gross += abs(w)
+            net += w
+        return gross, net
+
+    for dt, event_type, idx in events:
+        row = g.loc[idx]
+
+        if event_type == 0:
+            # EXIT
+            if idx not in open_pos:
+                continue
+
+            p = open_pos[idx]
+            w = float(p["w"])
+            notional = float(p["notional"])
+            entry_cost = float(p["entry_cost"])
+
+            raw_ret = float(row["raw_return_%"]) / 100.0
+            signed_ret = raw_ret if row["signal"] == "long" else -raw_ret
+
+            exit_cost = notional * float(transaction_cost)
+            pnl_gross = signed_ret * notional
+            trade_pnl = pnl_gross - entry_cost - exit_cost
+
+            balance += trade_pnl
+
+            g.at[idx, "position_weight"] = w
+            g.at[idx, "position_size"] = notional
+            g.at[idx, "entry_cost"] = entry_cost
+            g.at[idx, "exit_cost"] = exit_cost
+            g.at[idx, "return_%"] = signed_ret * 100.0
+            g.at[idx, "trade_pnl"] = trade_pnl
+            g.at[idx, "balance_after_trade"] = balance
+
+            del open_pos[idx]
+            continue
+
+        # ENTRY
+        if idx in open_pos:
+            continue
+
+        gross, net = exposures()
+
+        gross_headroom = float(max_gross) - gross
+        if gross_headroom <= 0.0:
+            continue
+
+        # Desired absolute weight limited by per-position cap + remaining gross
+        w_abs = min(float(per_position_cap), gross_headroom)
+        if w_abs <= 0.0:
+            continue
+
+        # Enforce net constraint using "net after trade"
+        if row["signal"] == "long":
+            w = w_abs
+            if abs(net + w) > float(max_net):
+                # clamp to max allowed
+                w = max(0.0, float(max_net) - net)
+        else:
+            w = -w_abs
+            if abs(net + w) > float(max_net):
+                # clamp to max allowed (negative)
+                w = -max(0.0, net + float(max_net))
+
+        if abs(w) <= 0.0:
+            continue
+
+        # FIXED notional at entry (based on current equity at time of entry)
+        notional = abs(w) * balance
+        if not np.isfinite(notional) or notional <= 0.0:
+            continue
+
+        entry_cost = notional * float(transaction_cost)
+
+        open_pos[idx] = {
+            "w": float(w),
+            "notional": float(notional),
+            "entry_cost": float(entry_cost),
+        }
+
+        g.at[idx, "position_weight"] = float(w)
+        g.at[idx, "position_size"] = float(notional)
+        g.at[idx, "entry_cost"] = float(entry_cost)
+        g.at[idx, "balance_after_entry"] = balance
+
+    return g
 
 
 def run_backtests(
@@ -191,27 +318,10 @@ def run_backtests(
     strategy="longshort",
     save_path="backtest/grid_results.csv",
     null_seed: int | None = None,
+    max_gross: float = 1.0,
+    max_net: float = 0.3,
+    per_position_cap: float = 0.05,
 ):
-    """Run backtests for different configurations.
-
-    Args:
-        bull_thresholds: List of bull threshold values to test
-        bear_thresholds: List of bear threshold values to test
-        wait_weeks: List of wait week values to test
-        hold_weeks: List of hold week values to test
-        lambdas: List of lambda values to test
-        robustness_ratio: Ratio to multiply st dev by for robust EAE calculation
-        initial_balance: Initial balance for the backtest
-        transaction_cost: Transaction cost as a percentage
-        analysis_mode: "real" or "null"
-        strategy: "l" or "s" or "longshort" to specify the strategy
-        save_path: Path to save the results
-        null_seed: Random seed for null mode (optional)
-
-    Returns:
-        DataFrame containing the results of the backtest
-    """
-
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -225,11 +335,9 @@ def run_backtests(
         3: "return_mode3_top3_vol_avg",
     }
 
-    # Load price and sentiment data once (big speedup, no result change)
     tickers = sorted(sentiment_df["ticker"].unique())
     price_cache = {t: load_price_data(t) for t in tickers}
     sent_by_ticker = {t: df.copy() for t, df in sentiment_df.groupby("ticker")}
-    max_position_size = (100 // len(tickers)) / 100
 
     results = []
 
@@ -238,8 +346,7 @@ def run_backtests(
             for mode_id, return_col in return_modes.items():
                 for w in wait_weeks:
                     for h in hold_weeks:
-                        # collect trades across tickers for THIS config
-                        signals = []
+                        trades = []
                         for ticker in tickers:
                             price_df = price_cache.get(ticker)
                             if price_df is None:
@@ -248,7 +355,7 @@ def run_backtests(
                             if ticker_df is None:
                                 continue
 
-                            ticker_signals = generate_signals_for_ticker(
+                            ticker_trades = generate_signals_for_ticker(
                                 bull,
                                 bear,
                                 ticker,
@@ -257,18 +364,25 @@ def run_backtests(
                                 return_col,
                                 w,
                                 h,
-                                initial_balance,
-                                transaction_cost,
-                                analysis_mode,
-                                strategy,
+                                analysis_mode=analysis_mode,
+                                strategy=strategy,
                                 null_seed=null_seed,
-                                max_position_size=max_position_size,
                             )
-                            signals.extend(ticker_signals)
+                            trades.extend(ticker_trades)
 
-                        trades_df = pd.DataFrame(signals)
+                        trades_df = pd.DataFrame(trades)
 
-                        metrics = summarize_trades_df(trades_df, initial_balance)
+                        # portfolio simulation (overlap-aware sizing)
+                        sim_df = simulate_portfolio_events(
+                            trades_df,
+                            initial_balance=float(initial_balance),
+                            transaction_cost=float(transaction_cost),
+                            max_gross=float(max_gross),
+                            max_net=float(max_net),
+                            per_position_cap=float(per_position_cap),
+                        )
+
+                        metrics = summarize_trades_df(sim_df, float(initial_balance))
 
                         row = {
                             "bull_threshold": bull,
@@ -279,13 +393,15 @@ def run_backtests(
                             "analysis_mode": analysis_mode,
                             "strategy": strategy,
                             "null_seed": null_seed,
+                            "max_gross": max_gross,
+                            "max_net": max_net,
+                            "per_position_cap": per_position_cap,
                             **metrics,
                         }
                         results.append(row)
 
     results_df = pd.DataFrame(results)
 
-    # Estimate n0 from the grid itself and compute EAE for each lambda (long format)
     n0_hat = int(estimate_n0_from_bins(results_df, metric="cum_return_pct"))
     min_trades = max(20, n0_hat // 2)
     results_df["n0_hat"] = n0_hat
@@ -314,10 +430,7 @@ def run_backtests(
 
     results_df["eae_mean"] = eae_means
     results_df["eae_std"] = eae_stds
-
-    results_df["eae"] = (
-        results_df["eae_mean"] - float(robustness_ratio) * results_df["eae_std"]
-    )
+    results_df["eae"] = results_df["eae_mean"] - float(robustness_ratio) * results_df["eae_std"]
 
     if save_path is not None:
         results_df.to_csv(save_path, index=False)

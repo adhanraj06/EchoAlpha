@@ -72,52 +72,56 @@ def run_config_study_bundle(
     run_eae_analysis(null_df, null_dir, null, top_k=top_k)
 
     analyze_timing_structure_stability(
-        longshort_df, longshort_dir, longshort, objective="eae"
+        longshort_df, longshort_dir, longshort, objective=objective
     )
-    analyze_timing_structure_stability(long_df, long_dir, long, objective="eae")
-    analyze_timing_structure_stability(null_df, null_dir, null, objective="eae")
+    analyze_timing_structure_stability(
+        long_df, long_dir, long, objective=objective
+    )
+    analyze_timing_structure_stability(
+        null_df, null_dir, null, objective=objective
+    )
 
     analyze_local_parameter_robustness(
-        longshort_df, longshort_dir, longshort, objective="eae", top_k=3
+        longshort_df, longshort_dir, longshort, objective=objective, top_k=3
     )
     analyze_local_parameter_robustness(
-        long_df, long_dir, long, objective="eae", top_k=3
+        long_df, long_dir, long, objective=objective, top_k=3
     )
     analyze_local_parameter_robustness(
-        null_df, null_dir, null, objective="eae", top_k=3
+        null_df, null_dir, null, objective=objective, top_k=3
     )
 
     analyze_trade_count_dependence(
-        longshort_df, longshort_dir, longshort, objective="eae"
+        longshort_df, longshort_dir, longshort, objective=objective
     )
-    analyze_trade_count_dependence(long_df, long_dir, long, objective="eae")
-    analyze_trade_count_dependence(null_df, null_dir, null, objective="eae")
+    analyze_trade_count_dependence(long_df, long_dir, long, objective=objective)
+    analyze_trade_count_dependence(null_df, null_dir, null, objective=objective)
 
     analyze_signal_quality_relationship(
-        longshort_df, longshort_dir, longshort, objective="eae"
+        longshort_df, longshort_dir, longshort, objective=objective
     )
-    analyze_signal_quality_relationship(long_df, long_dir, long, objective="eae")
-    analyze_signal_quality_relationship(null_df, null_dir, null, objective="eae")
+    analyze_signal_quality_relationship(long_df, long_dir, long, objective=objective)
+    analyze_signal_quality_relationship(null_df, null_dir, null, objective=objective)
 
     compare_long_short_vs_long_only(
-        longshort_df, long_df, longshort_dir, objective="eae"
+        longshort_df, long_df, longshort_dir, objective=objective
     )
 
     analyze_null_dominance(
-        longshort_df, null_df, longshort_dir, longshort, objective="eae", top_k=3
+        longshort_df, null_df, longshort_dir, longshort, objective=objective, top_k=3
     )
 
     analyze_multi_objective_tradeoffs(
-        longshort_df, longshort_dir, longshort, objective="eae"
+        longshort_df, longshort_dir, longshort, objective=objective
     )
-    analyze_multi_objective_tradeoffs(long_df, long_dir, long, objective="eae")
-    analyze_multi_objective_tradeoffs(null_df, null_dir, null, objective="eae")
+    analyze_multi_objective_tradeoffs(long_df, long_dir, long, objective=objective)
+    analyze_multi_objective_tradeoffs(null_df, null_dir, null, objective=objective)
 
     build_deployment_shortlist(
-        longshort_df, longshort_dir, longshort, objective="eae", top_n=3
+        longshort_df, longshort_dir, longshort, objective=objective, top_n=3
     )
-    build_deployment_shortlist(long_df, long_dir, long, objective="eae", top_n=3)
-    build_deployment_shortlist(null_df, null_dir, null, objective="eae", top_n=3)
+    build_deployment_shortlist(long_df, long_dir, long, objective=objective, top_n=3)
+    build_deployment_shortlist(null_df, null_dir, null, objective=objective, top_n=3)
 
     pareto_front(
         longshort_df,
@@ -168,8 +172,11 @@ def run_general_study(df: pd.DataFrame, dir: str, strategy_name: str):
         if s.empty:
             continue
 
+        s_plot = clip_to_quantiles(s, 0.01, 0.99)
+        bins = smart_bins(s_plot)
+
         plt.figure(figsize=(10, 6))
-        plt.hist(s, bins=50)
+        plt.hist(s, bins=bins)
         plt.axvline(
             s.mean(), color="red", linestyle="--", label=f"Mean: {s.mean():.2f}"
         )
@@ -242,8 +249,8 @@ def run_bull_bear_analysis(df: pd.DataFrame, dir: str, strategy_name: str):
         plt.title(f"eae by Bull/Bear for {strategy_name}")
         plt.xlabel("Bear Threshold")
         plt.ylabel("Bull Threshold")
-        plt.xticks(range(len(pivot.columns)), [str(int(c)) for c in pivot.columns])
-        plt.yticks(range(len(pivot.index)), [str(int(i)) for i in pivot.index])
+        plt.xticks(range(len(pivot.columns)), [f"{c:.2f}" for c in pivot.columns])
+        plt.yticks(range(len(pivot.index)), [f"{i:.2f}" for i in pivot.index])
         plt.tight_layout()
         plt.savefig(os.path.join(dir, f"{strategy_name}_heat_bull_bear_eae.png"))
         plt.close()
@@ -266,8 +273,8 @@ def run_bull_bear_analysis(df: pd.DataFrame, dir: str, strategy_name: str):
         with open(out_txt, "w") as f:
             f.write("best_bull_bear_by_mean_eae:\n")
             f.write(
-                f"bull={int(best['bull_threshold'])}, "
-                f"bear={int(best['bear_threshold'])}, "
+                f"bull={best['bull_threshold']:.2f}, "
+                f"bear={best['bear_threshold']:.2f}, "
                 f"eae_mean={best['eae_mean']:.6f}, "
                 f"eae_median={best['eae_median']:.6f}, "
                 f"trades_median={best['trades_median']:.3f}\n\n"
@@ -606,6 +613,15 @@ def analyze_timing_structure_stability(
             )
             plt.close()
 
+            # Write matrix to text file
+            with open(
+                os.path.join(
+                    dir, f"{strategy_name}_timing_{label.lower()}_mode_{int(mode)}.txt"
+                ),
+                "w",
+            ) as f:
+                f.write(pivot.to_string())
+                f.write("\n")
 
 def analyze_local_parameter_robustness(
     df: pd.DataFrame,
@@ -817,19 +833,19 @@ def compare_long_short_vs_long_only(
 
     plt.figure(figsize=(10, 5))
     plt.hist(merged["delta"], bins=40)
-    plt.axvline(merged["delta"].mean(), color="red", linestyle="--", label="Mean")
-    plt.axvline(merged["delta"].median(), color="blue", linestyle="--", label="Median")
+    plt.axvline(merged["delta"].mean(), color="red", linestyle="--", label=f"Mean: {merged['delta'].mean():.2f}")
+    plt.axvline(merged["delta"].median(), color="blue", linestyle="--", label=f"Median: {merged['delta'].median():.2f}")
     plt.axvline(
         merged["delta"].quantile(0.25),
         color="green",
         linestyle="--",
-        label="25th percentile",
+        label=f"25th percentile: {merged['delta'].quantile(0.25):.2f}",
     )
     plt.axvline(
         merged["delta"].quantile(0.75),
         color="green",
         linestyle="--",
-        label="75th percentile",
+        label=f"75th percentile: {merged['delta'].quantile(0.75):.2f}",
     )
     plt.title("Delta Objective: Long/Short Minus Long-Only")
     plt.xlabel("Delta")
@@ -900,19 +916,19 @@ def analyze_null_dominance(
 
     plt.figure(figsize=(10, 5))
     plt.hist(merged["z"].dropna(), bins=40)
-    plt.axvline(merged["z"].mean(), color="red", linestyle="--", label="Mean")
-    plt.axvline(merged["z"].median(), color="blue", linestyle="--", label="Median")
+    plt.axvline(merged["z"].mean(), color="red", linestyle="--", label=f"Mean: {merged['z'].mean():.2f}")
+    plt.axvline(merged["z"].median(), color="blue", linestyle="--", label=f"Median: {merged['z'].median():.2f}")
     plt.axvline(
         merged["z"].quantile(0.25),
         color="green",
         linestyle="--",
-        label="25th percentile",
+        label=f"25th percentile: {merged['z'].quantile(0.25):.2f}",
     )
     plt.axvline(
         merged["z"].quantile(0.75),
         color="green",
         linestyle="--",
-        label="75th percentile",
+        label=f"75th percentile: {merged['z'].quantile(0.75):.2f}",
     )
     plt.title(f"{strategy_name} Z Score vs Null")
     plt.xlabel("Z Score")
@@ -1133,3 +1149,43 @@ def finite_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     for c in keep:
         d[c] = as_numeric(d[c])
     return d.dropna(subset=keep)
+
+def smart_bins(s: pd.Series, max_bins: int = 60):
+    x = s.to_numpy(dtype=float)
+    n = len(x)
+    if n <= 1:
+        return 10
+
+    uniq = np.unique(x)
+
+    # Discrete / low-unique case -> bins around unique values
+    if len(uniq) <= 25:
+        # If it’s basically integers, make integer bins (looks clean for trades)
+        if np.all(np.isclose(uniq, np.round(uniq))):
+            mn, mx = int(np.min(x)), int(np.max(x))
+            return np.arange(mn - 0.5, mx + 1.5, 1.0)
+        # otherwise just use number of unique values
+        return min(len(uniq), 25)
+
+    # Continuous case -> Freedman–Diaconis
+    q25, q75 = np.percentile(x, [25, 75])
+    iqr = q75 - q25
+    if iqr <= 0:
+        return min(30, max_bins)
+
+    bw = 2 * iqr * (n ** (-1 / 3))
+    if bw <= 0:
+        return min(30, max_bins)
+
+    bins = int(np.ceil((x.max() - x.min()) / bw))
+    return max(10, min(bins, max_bins))
+
+
+def clip_to_quantiles(s: pd.Series, lo=0.01, hi=0.99) -> pd.Series:
+    if len(s) < 20:
+        return s
+    a = float(s.quantile(lo))
+    b = float(s.quantile(hi))
+    if not np.isfinite(a) or not np.isfinite(b) or a >= b:
+        return s
+    return s.clip(a, b)

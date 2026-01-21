@@ -2,11 +2,16 @@
 beautifulsoup4>=4.12.2
 matplotlib>=3.7.0
 nltk>=3.8.1
+numpy>=1.24.0
 pandas>=2.0.0
 seaborn>=0.12.2
 sec_edgar_downloader>=3.0.6
 tqdm>=4.65.0
 yfinance>=0.2.18
+transformers>=4.35.0
+torch>=2.0.0
+sentencepiece>=0.1.99
+accelerate>=0.25.0
 
 # Development Dependencies
 black>=23.3.0
