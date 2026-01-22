@@ -75,4 +75,4 @@ docs/src/index.html
 
 ## Important Note
 
-The end-to-end pipeline can be computationally and data intensive. The primary bottlenecks are SEC filing ingestion and large-scale simulation, especially SEC 10-Q scraping + MD&A extraction (network + parsing across many filings) and null / randomized backtest pool generation (Monte Carlo-style baselines over many runs). For reference, in a representative run (11 tickers), MD&A extraction took ~9 minutes and the null backtest pool took ~17 minutes, while the remaining steps completed in seconds to a few minutes.
+The end-to-end pipeline can be computationally and data intensive. The primary bottlenecks are SEC filing ingestion and large-scale simulation, especially SEC 10-Q scraping + MD&A extraction (network + parsing across many filings) and, most of all,null / randomized backtest pool generation (Monte Carlo-style baselines over many runs).
